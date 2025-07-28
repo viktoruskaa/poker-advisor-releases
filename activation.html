@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-g">
+    <title>Активация</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background: #f0f2f5; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; }
+        .container { background: white; padding: 30px; border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.1); text-align: center; width: 300px; }
+        h2 { margin-top: 0; color: #1c1e21; }
+        p { color: #606770; font-size: 14px; }
+        input { width: 100%; padding: 10px; margin: 15px 0; border: 1px solid #dddfe2; border-radius: 6px; box-sizing: border-box; }
+        button { width: 100%; padding: 10px; border: none; border-radius: 6px; background-color: #1877f2; color: white; font-size: 16px; font-weight: bold; cursor: pointer; }
+        button:hover { background-color: #166fe5; }
+        .error { color: #fa3e3e; font-size: 12px; margin-top: -10px; display: none; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h2>Активация</h2>
+        <p>Пожалуйста, введите ваш ключ доступа для активации приложения.</p>
+        <input type="text" id="license-key" placeholder="Ваш ключ доступа">
+        <p id="error-message" class="error"></p>
+        <button id="activate-btn">Активировать</button>
+    </div>
+    <script src="./activation.js"></script>
+</body>
+</html>

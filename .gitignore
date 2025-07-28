@@ -1,0 +1,22 @@
+# Dependencies
+/node_modules
+/.venv
+
+# Build artifacts
+/dist
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# System files
+.DS_Store
+Thumbs.db
+
+# Secrets
+credentials.json
+
+# Local data
+*.db

@@ -1,0 +1,29 @@
+{
+  "telegram": {
+    "bot_token": "YOUR_TELEGRAM_BOT_TOKEN_HERE",
+    "chat_id": "YOUR_TELEGRAM_CHAT_ID_HERE"
+  },
+  "poker_client": {
+    "my_player_name": "YourPlayerName",
+    "poker_room_name": "CoinPoker"
+  },
+  "ocr_settings": {
+    "scan_interval_ms": 2000,
+    "tesseract_path": "C:\\Program Files\\Tesseract-OCR\\tesseract.exe"
+  },
+  "scan_areas": {
+    "my_cards": { "x": 850, "y": 750, "width": 180, "height": 90 },
+    "community_cards": { "x": 680, "y": 450, "width": 400, "height": 90 },
+    "pot_size": { "x": 880, "y": 380, "width": 150, "height": 50 }
+  },
+  "bankroll_management": {
+    "current_bankroll": 1000,
+    "risk_level": "standard",
+    "currency": "USD"
+  },
+  "settings": {
+    "min_delay_ms": 1500,
+    "max_delay_ms": 3500,
+    "training_mode": true
+  }
+}
