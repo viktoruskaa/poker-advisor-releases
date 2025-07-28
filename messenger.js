@@ -1,34 +1,29 @@
 const axios = require('axios');
 
 class Messenger {
-  constructor(telegramConfig, settings, eventBus = null) {
+  constructor(telegramConfig, settings, eventBus = null, configPath = '') {
     this.bus = eventBus;
     this.settings = settings;
     this.lastRecommendation = null;
+    this.configPath = configPath;
 
-    if (!telegramConfig.bot_token || telegramConfig.bot_token === "YOUR_TELEGRAM_BOT_TOKEN_HERE") {
-        console.error("Токен Telegram-бота не указан в config.json!");
+    if (!telegramConfig.bot_token || telegramConfig.bot_token.includes("YOUR_TELEGRAM")) {
+        console.error("Токен Telegram-бота не указан или является заглушкой!");
         this.apiUrl = null;
     } else {
         this.apiUrl = `https://api.telegram.org/bot${telegramConfig.bot_token}`;
-        if (this.bus) {
-            this.startListening();
-        }
+        if (this.bus) this.startListening();
     }
-    this.chatId = telegramConfig.chat_id;
+    this.chatId = telegramConfig.chat_id.includes("YOUR_TELEGRAM") ? null : telegramConfig.chat_id;
   }
 
-  setLastRecommendation(rec) {
-      this.lastRecommendation = rec;
-  }
-
-  getLastRecommendation() {
-      return this.lastRecommendation;
-  }
+  setLastRecommendation(rec) { this.lastRecommendation = rec; }
+  getLastRecommendation() { return this.lastRecommendation; }
 
   startListening() {
     let offset = 0;
     setInterval(async () => {
+        if (!this.apiUrl) return;
         try {
             const response = await axios.post(`${this.apiUrl}/getUpdates`, { offset: offset, timeout: 10 });
             const updates = response.data.result;
@@ -37,9 +32,7 @@ class Messenger {
                 this.handleUpdates(updates);
             }
         } catch (error) {
-            if (error.code !== 'ECONNABORTED') {
-                console.error('Ошибка получения обновлений Telegram:', error.message);
-            }
+            if (error.code !== 'ECONNABORTED') console.error('Ошибка получения обновлений Telegram:', error.message);
         }
     }, 1000);
   }
@@ -48,7 +41,13 @@ class Messenger {
     for (const update of updates) {
         if (update.message && update.message.text) {
             const text = update.message.text;
-            if (text.startsWith('/') && this.bus) {
+            const chatId = update.message.chat.id;
+            const firstName = update.message.from.first_name;
+
+            if (text.startsWith('/start')) {
+                const welcomeMessage = this.getWelcomeMessage(chatId, firstName);
+                this.sendDirectMessage(chatId, welcomeMessage);
+            } else if (text.startsWith('/') && this.bus) {
                 const [command, ...args] = text.split(' ');
                 this.bus.emit('user-command', { type: command, args: args.join(' ') });
             }
@@ -56,33 +55,56 @@ class Messenger {
     }
   }
 
-  async sendMessage(rec) {
-    if (!this.apiUrl || !this.chatId) {
-        return;
-    }
+  getWelcomeMessage(chatId, firstName) {
+    return `👋 Привет, ${firstName}! Добро пожаловать в Poker Advisor.
 
-    let messageText = '';
-    if (rec.action) {
-        messageText = `РЕКОМЕНДАЦИЯ: ${rec.action}`;
-        if (rec.amount) messageText += ` (${rec.amount})`;
-        if (this.settings.training_mode && rec.reason) {
-            messageText += `\nПричина: ${rec.reason}`;
-        }
-    } else {
-        messageText = rec.text;
-    }
-    
-    const minDelay = this.settings.min_delay_ms || 1000;
-    const maxDelay = this.settings.max_delay_ms || 3000;
-    const delay = Math.floor(Math.random() * (maxDelay - minDelay + 1)) + minDelay;
+Для начала работы осталось совсем немного.
+
+**ШАГ 1: Установите Tesseract OCR**
+Если вы еще не установили Tesseract, скачайте его с официального сайта и установите. Это движок для распознавания текста.
+
+**ШАГ 2: Найдите и откройте файл конфигурации**
+Он был автоматически создан здесь:
+\`${this.configPath}\`
+(Скопируйте этот путь и вставьте в адресную строку вашего проводника)
+
+**ШАГ 3: Отредактируйте файл**
+Откройте \`config.json\` в Блокноте и настройте три параметра:
+
+1.  Ваш \`chat_id\`: \`${chatId}\`
+2.  Ваш никнейм в покере: \`Ваш_Ник_В_Игре\`
+3.  Путь к Tesseract: Укажите, куда вы его установили (например, \`C:\\Program Files\\Tesseract-OCR\\tesseract.exe\`). **Важно: используйте двойные обратные слэши (\\\\) в пути!**
+
+Пример после редактирования:
+\`\`\`json
+"chat_id": "${chatId}",
+"my_player_name": "PokerShark123",
+"tesseract_path": "C:\\\\Program Files\\\\Tesseract-OCR\\\\tesseract.exe"
+\`\`\`
+
+**ШАГ 4: Сохраните файл и перезапустите приложение**
+После сохранения просто закройте и снова запустите "Desktop Service Utility". Бот начнет работать. Удачи!`;
+  }
+
+  async sendDirectMessage(chatId, text) {
+      if (!this.apiUrl) return;
+      try {
+          await axios.post(`${this.apiUrl}/sendMessage`, { chat_id: chatId, text: text, parse_mode: 'Markdown' });
+      } catch (error) {
+          console.error('Ошибка прямой отправки в Telegram:', error.response ? error.response.data : error.message);
+      }
+  }
+
+  async sendMessage(rec) {
+    if (!this.apiUrl || !this.chatId) return;
+    let messageText = rec.action ? `РЕКОМЕНДАЦИЯ: ${rec.action}${rec.amount ? ` (${rec.amount})` : ''}${this.settings.training_mode && rec.reason ? `\nПричина: ${rec.reason}` : ''}` : rec.text;
+    const delay = Math.floor(Math.random() * (this.settings.max_delay_ms - this.settings.min_delay_ms + 1)) + this.settings.min_delay_ms;
 
     return new Promise(resolve => {
         setTimeout(() => {
             axios.post(`${this.apiUrl}/sendMessage`, { chat_id: this.chatId, text: messageText })
               .catch(error => console.error('Ошибка отправки в Telegram:', error.response ? error.response.data : error.message))
-              .finally(() => {
-                  resolve();
-              });
+              .finally(resolve);
         }, delay);
     });
   }

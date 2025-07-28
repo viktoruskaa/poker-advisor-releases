@@ -1,68 +1,77 @@
+const isEqual = require('lodash.isequal'); // Потребуется новая зависимость: npm install lodash.isequal
+
 class GameState {
   constructor(myPlayerName) {
     this.myPlayerName = myPlayerName;
+    this.bus = null; // Шина событий для new-hand
     this.reset();
+  }
+
+  setBus(eventBus) {
+    this.bus = eventBus;
   }
 
   reset() {
     this.handId = null;
-    this.players = []; // Массив объектов { id, name, stack, bet, position }
+    this.players = []; // Массив объектов { name, stack, bet, position, status, isHero }
     this.myCards = [];
     this.communityCards = [];
     this.pot = 0;
     this.currentStreet = 'preflop';
-    this.whosTurn = null;
-    this.lastBet = 0;
+    this.whosTurn = null; // TODO: Определять из парсера
     this.bigBlind = 0;
     this.lastHandResult = { profit: 0 };
-  }
-
-  startNewHand(handInfo) {
-    const lastResult = this.getAndClearLastHandResult();
-    const playersFromLastHand = this.players.map(p => ({ id: p.id, name: p.name, stack: p.stack }));
-    this.reset();
-    this.handId = handInfo.handId;
-    this.players = playersFromLastHand; // Сохраняем игроков для новой раздачи
-    this.lastHandResult = lastResult;
+    this.lastSnapshot = null;
   }
 
   getAndClearLastHandResult() {
-      // TODO: Реализовать реальный подсчет профита
+      // TODO: Реализовать реальный подсчет профита на основе данных из парсера
       return { profit: 0 };
   }
 
-  handleAction(action) {
-    let stateChanged = false;
-    // Обновляем информацию об игроках
-    if (action.seatId !== undefined) {
-        let player = this.players.find(p => p.id === action.seatId);
-        if (!player) {
-            player = { id: action.seatId };
-            this.players.push(player);
-        }
-        if (action.name) player.name = action.name;
-        if (action.stack) player.stack = action.stack;
-        if (action.type === 'BET') player.bet = action.amount;
+  updateFromSnapshot(snapshot) {
+    // Определяем, является ли это новой раздачей.
+    // Критерий: карты борда сбросились или изменились карты героя.
+    const isNewHand = !this.lastSnapshot || 
+                      snapshot.board.length < this.lastSnapshot.board.length ||
+                      !isEqual(snapshot.hero.cards, this.lastSnapshot.hero.cards);
+
+    if (isNewHand) {
+        const newHandId = Date.now(); // Генерируем ID, т.к. парсер его не дает
+        if (this.bus) this.bus.emit('new-hand-started', newHandId);
+        this.reset();
+        this.handId = newHandId;
     }
 
-    // Обновляем состояние стола
-    if (action.type === 'DEAL_HERO') this.myCards = action.cards; // Предполагается, что парсер определит наши карты
-    if (action.type === 'DEAL_FLOP') { this.currentStreet = 'flop'; this.communityCards = action.cards; stateChanged = true; }
-    if (action.type === 'DEAL_TURN') { this.currentStreet = 'turn'; this.communityCards.push(...action.cards); stateChanged = true; }
-    if (action.type === 'DEAL_RIVER') { this.currentStreet = 'river'; this.communityCards.push(...action.cards); stateChanged = true; }
-    if (action.type === 'POT_UPDATE') this.pot = action.amount;
+    // Обновляем состояние
+    this.pot = snapshot.pot || 0;
+    this.communityCards = snapshot.board || [];
+    this.myCards = snapshot.hero.cards || [];
+    this.players = snapshot.players || [];
+    this.bigBlind = snapshot.blinds ? snapshot.blinds.big : 0;
 
+    if (this.communityCards.length === 5) this.currentStreet = 'river';
+    else if (this.communityCards.length === 4) this.currentStreet = 'turn';
+    else if (this.communityCards.length === 3) this.currentStreet = 'flop';
+    else this.currentStreet = 'preflop';
+
+    const stateChanged = !isEqual(snapshot, this.lastSnapshot);
+    this.lastSnapshot = snapshot;
     return stateChanged;
   }
   
   isMyTurn() {
-    // TODO: Реализовать логику определения нашего хода
-    return true;
+    // TODO: Реализовать логику определения нашего хода на основе данных из парсера
+    // Например, парсер может добавлять флаг "isMyTurn: true" к объекту героя.
+    return true; // ЗАГЛУШКА
   }
 
   getCurrentState() {
-    const myPlayer = this.players.find(p => p.name === this.myPlayerName) || {};
-    const effectiveStack = Math.min(...this.players.filter(p => p.stack > 0).map(p => p.stack));
+    const myPlayer = this.players.find(p => p.name === this.myPlayerName) || 
+                     this.players.find(p => p.isHero) || {};
+    
+    const activePlayers = this.players.filter(p => p.status === 'active' && p.stack > 0);
+    const effectiveStack = activePlayers.length > 0 ? Math.min(...activePlayers.map(p => p.stack)) : 0;
     const effectiveStackInBB = this.bigBlind > 0 ? effectiveStack / this.bigBlind : 0;
 
     return {
@@ -70,10 +79,10 @@ class GameState {
       communityCards: this.communityCards,
       pot: this.pot,
       currentStreet: this.currentStreet,
-      opponents: this.players.filter(p => p.name !== this.myPlayerName),
-      lastBet: this.lastBet,
-      isInPosition: true, // ЗАГЛУШКА
-      isBubble: false, // ЗАГЛУШКА
+      opponents: this.players.filter(p => p.name !== this.myPlayerName && !p.isHero),
+      lastBet: 0, // ЗАГЛУШКА: нужно получать из парсера
+      isInPosition: true, // ЗАГЛУШКА: нужно определять по позициям
+      isBubble: false, // ЗАГЛУШКА: нужна логика турнира
       table_size: this.players.length,
       position: myPlayer.position || 'Unknown',
       effectiveStackInBB: effectiveStackInBB

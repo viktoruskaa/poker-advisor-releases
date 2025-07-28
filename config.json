@@ -7,14 +7,10 @@
     "my_player_name": "YourPlayerName",
     "poker_room_name": "CoinPoker"
   },
-  "ocr_settings": {
-    "scan_interval_ms": 2000,
-    "tesseract_path": "C:\\Program Files\\Tesseract-OCR\\tesseract.exe"
-  },
-  "scan_areas": {
-    "my_cards": { "x": 850, "y": 750, "width": 180, "height": 90 },
-    "community_cards": { "x": 680, "y": 450, "width": 400, "height": 90 },
-    "pot_size": { "x": 880, "y": 380, "width": 150, "height": 50 }
+  "parser_settings": {
+    "python_path": "python",
+    "script_path": "parser.py",
+    "scan_interval_ms": 3000
   },
   "bankroll_management": {
     "current_bankroll": 1000,
