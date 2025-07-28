@@ -1,0 +1,1018 @@
+--- Файл: .\.gitignore ---
+
+# Dependencies
+/node_modules
+/.venv
+
+# Build artifacts
+/dist
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# System files
+.DS_Store
+Thumbs.db
+
+# Secrets
+credentials.json
+
+# Local data
+*.db
+
+================================================================================
+
+--- Файл: .\bankrollManager.js ---
+
+const Store = require('electron-store');
+
+class BankrollManager {
+  constructor(config) {
+    this.config = config;
+    this.store = new Store({
+        name: 'bankroll-data',
+        defaults: {
+            current_bankroll: this.config.current_bankroll || 0,
+            tournaments_played: 0,
+            recent_results: [] // Массив последних 100 результатов
+        }
+    });
+    this.rules = {
+      conservative: { min_abi: 200 },
+      standard: { min_abi: 100 },
+      aggressive: { min_abi: 50 }
+    };
+  }
+
+  getCurrentBankroll() {
+    return this.store.get('current_bankroll');
+  }
+
+  updateBankroll(profitOrLoss) {
+    const current = this.getCurrentBankroll();
+    const played = this.store.get('tournaments_played');
+    const results = this.store.get('recent_results');
+
+    results.push(profitOrLoss);
+    if (results.length > 100) {
+        results.shift(); // Оставляем только последние 100
+    }
+
+    this.store.set('current_bankroll', current + profitOrLoss);
+    this.store.set('tournaments_played', played + 1);
+    this.store.set('recent_results', results);
+  }
+
+  getRecommendation() {
+    const bankroll = this.getCurrentBankroll();
+    let riskLevel = this.config.risk_level || 'standard';
+
+    // Динамическая корректировка риска
+    if (this._isDownswing()) {
+        riskLevel = 'conservative';
+    }
+
+    const rule = this.rules[riskLevel];
+    if (!rule) {
+        return `ОШИБКА: Неверный уровень риска "${riskLevel}" в config.json.`;
+    }
+
+    const recommendedABI = (bankroll / rule.min_abi).toFixed(2);
+    let message = `--- Управление Банкроллом ---\n` +
+                  `Текущий банкролл: ${bankroll.toFixed(2)} ${this.config.currency}\n` +
+                  `Уровень риска: ${riskLevel}\n` +
+                  `Рекомендуемый средний бай-ин (ABI): до ${recommendedABI} ${this.config.currency}`;
+
+    if (this._isDownswing()) {
+        message += `\nВНИМАНИЕ: Обнаружен даунсвинг! Рекомендуется более консервативная стратегия.`;
+    }
+
+    return message;
+  }
+
+  _isDownswing() {
+      const results = this.store.get('recent_results');
+      const tournamentsPlayed = this.store.get('tournaments_played');
+      if (tournamentsPlayed < 100) return false;
+
+      // Считаем проигрыш в бай-инах за последние 100 турниров
+      const averageBuyIn = Math.abs(results.reduce((a, b) => a + (b < 0 ? b : 0), 0) / results.filter(r => r < 0).length) || 10;
+      const totalLoss = results.reduce((a, b) => a + b, 0);
+      
+      // Проигрыш 20 бай-инов за 100 турниров
+      return totalLoss < -(20 * averageBuyIn);
+  }
+}
+
+module.exports = BankrollManager;
+
+================================================================================
+
+--- Файл: .\brain.js ---
+
+const PokerEvaluator = require('poker-evaluator');
+const GTO_CHARTS = require('./gto-charts.js');
+
+class Brain {
+  getRecommendation(gameState, opponentProfiles) {
+    if (!gameState.myCards || gameState.myCards.length < 2) {
+        return null;
+    }
+
+    if (gameState.isBubble && gameState.stackProfile === 'medium') {
+        const handStrength = PokerEvaluator.evalHand(gameState.myCards, gameState.communityCards);
+        if (handStrength.handRank < 5) {
+            return {
+                action: 'Check/Fold',
+                reason: `ICM давление на баббле. Избегаем риска со средней рукой (${handStrength.handName}), чтобы пересидеть короткие стеки.`
+            };
+        }
+    }
+
+    switch (gameState.currentStreet) {
+      case 'preflop':
+        return this._getPreflopAction(gameState, opponentProfiles);
+      case 'flop':
+      case 'turn':
+      case 'river':
+        return this._getPostflopAction(gameState, opponentProfiles);
+      default:
+        return { action: 'Fold', reason: 'Логика для этой улицы не реализована.' };
+    }
+  }
+
+  _getPreflopAction(gameState, opponentProfiles) {
+    const { position, effectiveStackInBB, myCards, table_size } = gameState;
+    const hand = this._formatHand(myCards);
+    const tableKey = `${table_size}-max`;
+
+    let stackRangeKey;
+    if (effectiveStackInBB <= 15) stackRangeKey = '10-15bb';
+    else if (effectiveStackInBB <= 25) stackRangeKey = '15-25bb';
+    else if (effectiveStackInBB <= 40) stackRangeKey = '25-40bb';
+    else stackRangeKey = '40bb+';
+
+    const chart = GTO_CHARTS[tableKey]?.[stackRangeKey]?.[position];
+    if (!chart) {
+      return { action: 'Fold', reason: `Нет GTO-чарта для ${tableKey}, позиции ${position} со стеком ${effectiveStackInBB}bb.` };
+    }
+
+    const actionType = effectiveStackInBB <= 15 ? 'push' : 'open_raise';
+    let actionRange = [...(chart[actionType] || [])];
+
+    const opponentOnBB = opponentProfiles['PlayerOnBB']; 
+    if (position === 'BTN' && opponentOnBB && opponentOnBB.foldToSteal > 80) {
+        actionRange.push('97s', '86s', '75s', 'A2o', 'K5o');
+    }
+
+    if (actionRange.includes(hand)) {
+        const actionText = actionType === 'push' ? 'Push All-in' : 'Raise';
+        return {
+            action: actionText,
+            amount: '2.5bb',
+            reason: `Рука (${hand}) входит в стандартный диапазон ${actionType} для ${position} со стеком ${effectiveStackInBB}bb.`
+        };
+    }
+
+    return {
+        action: 'Fold',
+        reason: `Рука (${hand}) не входит в диапазон ${actionType} для ${position} со стеком ${effectiveStackInBB}bb.`
+    };
+  }
+
+  _getPostflopAction(gameState, opponentProfiles) {
+    const handStrength = PokerEvaluator.evalHand(gameState.myCards, gameState.communityCards);
+    const boardTexture = this._analyzeBoardTexture(gameState.communityCards);
+    const { handRank, handName, isDraw } = handStrength;
+    const opponent = opponentProfiles['ActiveOpponent'];
+
+    if (isDraw) {
+        const potOdds = gameState.lastBet > 0 ? (gameState.lastBet / (gameState.pot + gameState.lastBet)) * 100 : 0;
+        const { equity, outs } = this._calculateDrawEquity(gameState.myCards, gameState.communityCards);
+        const reason = `У вас дро-рука (${handName}, ${outs} аутов, ~${equity.toFixed(1)}% эквити). Шансы банка: ${potOdds.toFixed(1)}%.`;
+        
+        if (equity > potOdds) {
+            return { action: 'Call', reason: `${reason} Колл является прибыльным.` };
+        } else {
+            return { action: 'Fold', reason: `${reason} Колл не является прибыльным.` };
+        }
+    }
+
+    if (gameState.currentStreet === 'flop') {
+        if (opponent && opponent.foldToCbet > 60 && boardTexture === 'DRY') {
+            return { action: 'Bet', amount: '33% пота', reason: `Эксплойт: C-bet против игрока, который часто фолдит (${opponent.foldToCbet}%).` };
+        }
+        if (boardTexture === 'DRY' && gameState.isInPosition) {
+            return { action: 'Bet', amount: '33% пота', reason: `C-bet на сухой доске в позиции.` };
+        }
+    }
+
+    if (handRank >= 5) {
+        return { action: 'Bet', amount: '66% пота', reason: `Вэлью-бет с сильной рукой (${handName}).` };
+    }
+
+    return { action: 'Check/Fold', reason: `Нет достаточных оснований для ставки с рукой ${handName} на доске типа ${boardTexture}.` };
+  }
+
+  _calculateDrawEquity(myCards, communityCards) {
+      const hand = [...myCards, ...communityCards];
+      const handStrength = PokerEvaluator.evalHand(myCards, communityCards);
+      let outs = 0;
+
+      if (handStrength.handName.includes('Flush Draw')) {
+          const suits = hand.map(c => c[1]);
+          const flushSuitEntry = Object.entries(suits.reduce((acc, suit) => { acc[suit] = (acc[suit] || 0) + 1; return acc; }, {})).find(([suit, count]) => count >= 4);
+          if (flushSuitEntry) {
+            const flushSuit = flushSuitEntry[0];
+            outs += (13 - hand.filter(c => c[1] === flushSuit).length);
+          }
+      }
+      
+      const equity = communityCards.length === 4 ? outs * 2.1 : outs * 4.2;
+      return { equity, outs };
+  }
+
+  _analyzeBoardTexture(communityCards) {
+    if (!communityCards || communityCards.length < 3) return 'UNKNOWN';
+    const ranks = communityCards.map(c => c[0]);
+    const suits = communityCards.map(c => c[1]);
+    const rankValues = { '2': 2, '3': 3, '4': 4, '5': 5, '6': 6, '7': 7, '8': 8, '9': 9, 'T': 10, 'J': 11, 'Q': 12, 'K': 13, 'A': 14 };
+    if (new Set(suits).size === 1) return 'WET_MONOTONE';
+    if (new Set(ranks).size < ranks.length) return 'PAIRED';
+    const numericRanks = ranks.map(r => rankValues[r]).sort((a, b) => a - b);
+    const isConnected = (numericRanks[2] - numericRanks[0] <= 4) || (numericRanks.length > 3 && numericRanks[3] - numericRanks[1] <= 4);
+    const isTwoTone = new Set(suits).size === 2;
+    if (isConnected || isTwoTone) return 'WET_DRAWY';
+    return 'DRY';
+  }
+
+  _formatHand(cards) {
+    const c1 = { rank: cards[0][0], suit: cards[0][1] };
+    const c2 = { rank: cards[1][0], suit: cards[1][1] };
+    if (c1.rank === c2.rank) return `${c1.rank}${c2.rank}`;
+    const ranksOrder = ['A', 'K', 'Q', 'J', 'T', '9', '8', '7', '6', '5', '4', '3', '2'];
+    const highCard = ranksOrder.indexOf(c1.rank) < ranksOrder.indexOf(c2.rank) ? c1 : c2;
+    const lowCard = highCard === c1 ? c2 : c1;
+    return c1.suit === c2.suit ? `${highCard.rank}${lowCard.rank}s` : `${highCard.rank}${lowCard.rank}o`;
+  }
+}
+
+module.exports = Brain;
+
+================================================================================
+
+--- Файл: .\config.json ---
+
+{
+  "telegram": {
+    "bot_token": "YOUR_TELEGRAM_BOT_TOKEN_HERE",
+    "chat_id": "YOUR_TELEGRAM_CHAT_ID_HERE"
+  },
+  "poker_client": {
+    "my_player_name": "YourPlayerName",
+    "poker_room_name": "CoinPoker"
+  },
+  "ocr_settings": {
+    "scan_interval_ms": 2000,
+    "tesseract_path": "C:\\Program Files\\Tesseract-OCR\\tesseract.exe"
+  },
+  "scan_areas": {
+    "my_cards": { "x": 850, "y": 750, "width": 180, "height": 90 },
+    "community_cards": { "x": 680, "y": 450, "width": 400, "height": 90 },
+    "pot_size": { "x": 880, "y": 380, "width": 150, "height": 50 }
+  },
+  "bankroll_management": {
+    "current_bankroll": 1000,
+    "risk_level": "standard",
+    "currency": "USD"
+  },
+  "settings": {
+    "min_delay_ms": 1500,
+    "max_delay_ms": 3500,
+    "training_mode": true
+  }
+}
+
+================================================================================
+
+--- Файл: .\gameState.js ---
+
+class GameState {
+  constructor(myPlayerName) {
+    this.myPlayerName = myPlayerName;
+    this.reset();
+  }
+
+  reset() {
+    this.handId = null;
+    this.players = []; // Массив объектов { id, name, stack, bet, position }
+    this.myCards = [];
+    this.communityCards = [];
+    this.pot = 0;
+    this.currentStreet = 'preflop';
+    this.whosTurn = null;
+    this.lastBet = 0;
+    this.bigBlind = 0;
+    this.lastHandResult = { profit: 0 };
+  }
+
+  startNewHand(handInfo) {
+    const lastResult = this.getAndClearLastHandResult();
+    const playersFromLastHand = this.players.map(p => ({ id: p.id, name: p.name, stack: p.stack }));
+    this.reset();
+    this.handId = handInfo.handId;
+    this.players = playersFromLastHand; // Сохраняем игроков для новой раздачи
+    this.lastHandResult = lastResult;
+  }
+
+  getAndClearLastHandResult() {
+      // TODO: Реализовать реальный подсчет профита
+      return { profit: 0 };
+  }
+
+  handleAction(action) {
+    let stateChanged = false;
+    // Обновляем информацию об игроках
+    if (action.seatId !== undefined) {
+        let player = this.players.find(p => p.id === action.seatId);
+        if (!player) {
+            player = { id: action.seatId };
+            this.players.push(player);
+        }
+        if (action.name) player.name = action.name;
+        if (action.stack) player.stack = action.stack;
+        if (action.type === 'BET') player.bet = action.amount;
+    }
+
+    // Обновляем состояние стола
+    if (action.type === 'DEAL_HERO') this.myCards = action.cards; // Предполагается, что парсер определит наши карты
+    if (action.type === 'DEAL_FLOP') { this.currentStreet = 'flop'; this.communityCards = action.cards; stateChanged = true; }
+    if (action.type === 'DEAL_TURN') { this.currentStreet = 'turn'; this.communityCards.push(...action.cards); stateChanged = true; }
+    if (action.type === 'DEAL_RIVER') { this.currentStreet = 'river'; this.communityCards.push(...action.cards); stateChanged = true; }
+    if (action.type === 'POT_UPDATE') this.pot = action.amount;
+
+    return stateChanged;
+  }
+  
+  isMyTurn() {
+    // TODO: Реализовать логику определения нашего хода
+    return true;
+  }
+
+  getCurrentState() {
+    const myPlayer = this.players.find(p => p.name === this.myPlayerName) || {};
+    const effectiveStack = Math.min(...this.players.filter(p => p.stack > 0).map(p => p.stack));
+    const effectiveStackInBB = this.bigBlind > 0 ? effectiveStack / this.bigBlind : 0;
+
+    return {
+      myCards: this.myCards,
+      communityCards: this.communityCards,
+      pot: this.pot,
+      currentStreet: this.currentStreet,
+      opponents: this.players.filter(p => p.name !== this.myPlayerName),
+      lastBet: this.lastBet,
+      isInPosition: true, // ЗАГЛУШКА
+      isBubble: false, // ЗАГЛУШКА
+      table_size: this.players.length,
+      position: myPlayer.position || 'Unknown',
+      effectiveStackInBB: effectiveStackInBB
+    };
+  }
+}
+
+module.exports = GameState;
+
+================================================================================
+
+--- Файл: .\gto-charts.js ---
+
+// Вспомогательные функции для компактного описания диапазонов
+const RANKS = ['2', '3', '4', '5', '6', '7', '8', '9', 'T', 'J', 'Q', 'K', 'A'];
+
+function expandPairs(hand) { // '66+' -> ['66', '77', ..., 'AA']
+    const rank = hand.slice(0, -1);
+    const startIndex = RANKS.indexOf(rank);
+    return RANKS.slice(startIndex).map(r => `${r}${r}`);
+}
+
+function expandSuited(hand) { // 'AJs+' -> ['AJs', 'AQs', 'AKs']
+    const rank = hand[0];
+    const kicker = hand[1];
+    const startIndex = RANKS.indexOf(kicker);
+    const rankIndex = RANKS.indexOf(rank);
+    return RANKS.slice(startIndex, rankIndex).map(k => `${rank}${k}s`);
+}
+
+function expandOffsuit(hand) { // 'AKo+' is complex, for now we list them
+    if (hand === 'AKo+') return ['AKo'];
+    if (hand === 'AQo+') return ['AQo', 'AKo'];
+    return [hand];
+}
+
+// Чарты, основанные на вашем исследовательском отчете
+const GTO_CHARTS = {
+    "9-max": {
+        "10-15bb": {
+            "UTG": { "push": [...expandPairs('22+'), ...expandOffsuit('AQo+'), ...expandSuited('AQs+')] },
+            "BTN": { "push": [...expandPairs('99+'), ...expandOffsuit('AQo+'), ...expandSuited('AJs+'), 'KQs', 'KJs', 'QTs'] }
+        },
+        "40bb+": {
+            "BTN": { "open_raise": [...expandPairs('66+'), ...expandOffsuit('AQo+'), ...expandSuited('AJs+'), 'KQs', 'KJs', 'QTs', 'JTs', 'T9s', '98s'] }
+        }
+    },
+    "6-max": {
+        "10-15bb": {
+            "UTG": { "open_raise": [...expandPairs('TT+'), ...expandOffsuit('AKo+'), ...expandSuited('AJs+'), 'KQs'] }
+        }
+    }
+};
+
+module.exports = GTO_CHARTS;
+
+================================================================================
+
+--- Файл: .\knowledgeBase.js ---
+
+class KnowledgeBase {
+    constructor() {
+        this.topics = {
+            'icm': 'ICM (Independent Chip Model) - это математическая модель для оценки стоимости турнирных фишек в реальных деньгах. Она критически важна на поздних стадиях турнира (баббл, финальный стол), так как помогает принимать решения, максимизирующие вашу денежную прибыль, а не просто количество фишек.',
+            'vpip': 'VPIP (Voluntarily Put Money In Pot) - это процент рук, в которых игрок добровольно вкладывает деньги в банк на префлопе. Это ключевой показатель для определения стиля игрока: тайтовый (низкий VPIP) или лузовый (высокий VPIP).',
+            'cbet': 'C-bet (Continuation Bet) - это ставка, которую делает игрок на флопе после того, как он был агрессором на префлопе. Это стандартный прием для оказания давления на оппонентов.',
+            'positions': 'Позиции за столом (UTG, MP, CO, BTN, SB, BB) - это места игроков относительно дилера. Ранние позиции (UTG) требуют более сильных рук для входа в игру, поздние (CO, BTN) позволяют играть более широкий диапазон рук.',
+            'pot odds': 'Пот-оддсы (шансы банка) - это соотношение размера текущего банка к размеру ставки, которую необходимо заколлировать. Помогает понять, является ли колл с дро-рукой математически прибыльным.',
+            'implied odds': 'Имплайд-оддсы (потенциальные шансы) - это учет будущих ставок, которые можно выиграть, если ваше дро закроется. Они могут оправдать колл, даже если прямые пот-оддсы невыгодны.'
+        };
+    }
+
+    getTopic(topic) {
+        const key = topic.toLowerCase().replace(/\s/g, '');
+        return this.topics[key] || `Тема "${topic}" не найдена. Доступные темы: ${Object.keys(this.topics).join(', ')}.`;
+    }
+}
+
+module.exports = KnowledgeBase;
+
+================================================================================
+
+--- Файл: .\logger.js ---
+
+const fs = require('fs');
+const path = require('path');
+
+const logFilePath = path.join(__dirname, 'poker-advisor.log');
+
+function log(message) {
+  const timestamp = new Date().toISOString();
+  const logMessage = `[${timestamp}] ${message}\n`;
+
+  try {
+    fs.appendFileSync(logFilePath, logMessage, 'utf8');
+  } catch (error) {
+    console.error('Не удалось записать в лог-файл:', error);
+  }
+}
+
+module.exports = { log };
+
+================================================================================
+
+--- Файл: .\main.js ---
+
+const { app, BrowserWindow } = require('electron');
+const path = require('path');
+const fs = require('fs');
+const EventEmitter = require('events');
+const screenshot = require('screenshot-desktop');
+const sharp = require('sharp');
+const { autoUpdater } = require('electron-updater');
+
+// Импорт модулей
+const Parser = require('./parser.js');
+const GameState = require('./gameState.js');
+const Profiler = require('./profiler.js');
+const Brain = require('./brain.js');
+const Messenger = require('./messenger.js');
+const BankrollManager = require('./bankrollManager.js');
+const KnowledgeBase = require('./knowledgeBase.js');
+const logger = require('./logger.js');
+
+const bus = new EventEmitter();
+
+// Состояние для проактивных уведомлений, чтобы не спамить
+let notifiedBubble = false;
+let notifiedShortStack = false;
+
+// --- Логика авто-обновления ---
+autoUpdater.on('update-available', () => {
+  logger.log('Доступно обновление.');
+});
+autoUpdater.on('update-not-available', () => {
+  logger.log('Обновлений нет.');
+});
+autoUpdater.on('update-downloaded', () => {
+  logger.log('Обновление скачано. Оно будет установлено при следующем запуске.');
+});
+autoUpdater.on('error', (err) => {
+  logger.log('Ошибка при обновлении: ' + err);
+});
+
+function runMainBot() {
+  logger.log('--- Приложение запущено ---');
+
+  const configPath = path.join(__dirname, 'config.json');
+  if (!fs.existsSync(configPath)) {
+    logger.log('КРИТИЧЕСКАЯ ОШИБКА: Файл config.json не найден!');
+    app.quit();
+    return;
+  }
+  const config = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+
+  const parser = new Parser(config.ocr_settings, bus);
+  const gameState = new GameState(config.poker_client.my_player_name);
+  const profiler = new Profiler();
+  const brain = new Brain();
+  const messenger = new Messenger(config.telegram, config.settings, bus);
+  const bankrollManager = new BankrollManager(config.bankroll_management);
+  const knowledgeBase = new KnowledgeBase();
+
+  const initialRecommendation = bankrollManager.getRecommendation();
+  messenger.sendMessage({ text: initialRecommendation });
+  logger.log(`Отправлена рекомендация по банкроллу: ${initialRecommendation.replace(/\n/g, ' ')}`);
+
+  bus.on('new-hand-started', (handInfo) => {
+    notifiedBubble = false;
+    notifiedShortStack = false;
+    const lastHandResult = gameState.getAndClearLastHandResult();
+    if (lastHandResult.profit !== 0) {
+        bankrollManager.updateBankroll(lastHandResult.profit);
+    }
+    gameState.startNewHand(handInfo);
+    logger.log(`Началась новая рука: ID ${handInfo.handId}`);
+  });
+
+  bus.on('game-action', (action) => {
+    const stateChanged = gameState.handleAction(action);
+    if (stateChanged) {
+        const currentState = gameState.getCurrentState();
+        if (currentState.isBubble && !notifiedBubble) {
+            messenger.sendMessage({ text: "ВНИМАНИЕ: Вы на баббле! Играйте более осторожно." });
+            logger.log("Отправлено уведомление о баббле.");
+            notifiedBubble = true;
+        }
+        if (currentState.effectiveStackInBB > 0 && currentState.effectiveStackInBB < 15 && !notifiedShortStack) {
+            messenger.sendMessage({ text: `ВНИМАНИЕ: Ваш стек стал коротким (${currentState.effectiveStackInBB.toFixed(1)}bb). Переходите на стратегию Push/Fold.` });
+            logger.log(`Отправлено уведомление о коротком стеке: ${currentState.effectiveStackInBB.toFixed(1)}bb.`);
+            notifiedShortStack = true;
+        }
+
+        if (gameState.isMyTurn()) {
+            bus.emit('my-turn-to-act');
+        }
+    }
+  });
+
+  bus.on('my-turn-to-act', () => {
+    const currentState = gameState.getCurrentState();
+    if (currentState.myCards.length > 0) {
+      const recommendation = brain.getRecommendation(currentState, {});
+      if (recommendation) {
+        logger.log(`Мозг принял решение: ${recommendation.action} (${recommendation.amount || ''}). Причина: ${recommendation.reason}`);
+        messenger.setLastRecommendation(recommendation);
+        bus.emit('send-recommendation', recommendation);
+      }
+    }
+  });
+
+  bus.on('send-recommendation', (recommendation) => messenger.sendMessage(recommendation));
+
+  bus.on('user-command', (command) => {
+    logger.log(`Получена команда от пользователя: ${command.type} ${command.args}`);
+    if (command.type === '/why') {
+        const explanation = messenger.getLastRecommendation();
+        messenger.sendMessage(explanation || { text: "Нет последней рекомендации для объяснения." });
+    }
+    if (command.type === '/learn') {
+        const explanation = knowledgeBase.getTopic(command.args);
+        messenger.sendMessage({ text: explanation });
+    }
+  });
+
+  setInterval(async () => {
+    try {
+      const fullScreenBuffer = await screenshot();
+      for (const areaName in config.scan_areas) {
+        const area = config.scan_areas[areaName];
+        const areaBuffer = await sharp(fullScreenBuffer)
+          .extract({ left: area.x, top: area.y, width: area.width, height: area.height })
+          .toBuffer();
+        await parser.processArea(areaBuffer, areaName);
+      }
+    } catch (error) {
+      logger.log(`КРИТИЧЕСКАЯ ОШИБКА в главном цикле OCR: ${error.message}`);
+    }
+  }, config.ocr_settings.scan_interval_ms);
+}
+
+app.on('ready', () => {
+  runMainBot();
+  autoUpdater.checkForUpdatesAndNotify();
+});
+
+app.on('window-all-closed', () => {
+  if (process.platform !== 'darwin') {
+    app.quit();
+  }
+});
+
+================================================================================
+
+--- Файл: .\messenger.js ---
+
+const axios = require('axios');
+
+class Messenger {
+  constructor(telegramConfig, settings, eventBus = null) {
+    this.bus = eventBus;
+    this.settings = settings;
+    this.lastRecommendation = null;
+
+    if (!telegramConfig.bot_token || telegramConfig.bot_token === "YOUR_TELEGRAM_BOT_TOKEN_HERE") {
+        console.error("Токен Telegram-бота не указан в config.json!");
+        this.apiUrl = null;
+    } else {
+        this.apiUrl = `https://api.telegram.org/bot${telegramConfig.bot_token}`;
+        if (this.bus) {
+            this.startListening();
+        }
+    }
+    this.chatId = telegramConfig.chat_id;
+  }
+
+  setLastRecommendation(rec) {
+      this.lastRecommendation = rec;
+  }
+
+  getLastRecommendation() {
+      return this.lastRecommendation;
+  }
+
+  startListening() {
+    let offset = 0;
+    setInterval(async () => {
+        try {
+            const response = await axios.post(`${this.apiUrl}/getUpdates`, { offset: offset, timeout: 10 });
+            const updates = response.data.result;
+            if (updates.length > 0) {
+                offset = updates[updates.length - 1].update_id + 1;
+                this.handleUpdates(updates);
+            }
+        } catch (error) {
+            if (error.code !== 'ECONNABORTED') {
+                console.error('Ошибка получения обновлений Telegram:', error.message);
+            }
+        }
+    }, 1000);
+  }
+
+  handleUpdates(updates) {
+    for (const update of updates) {
+        if (update.message && update.message.text) {
+            const text = update.message.text;
+            if (text.startsWith('/') && this.bus) {
+                const [command, ...args] = text.split(' ');
+                this.bus.emit('user-command', { type: command, args: args.join(' ') });
+            }
+        }
+    }
+  }
+
+  async sendMessage(rec) {
+    if (!this.apiUrl || !this.chatId) {
+        return;
+    }
+
+    let messageText = '';
+    if (rec.action) {
+        messageText = `РЕКОМЕНДАЦИЯ: ${rec.action}`;
+        if (rec.amount) messageText += ` (${rec.amount})`;
+        if (this.settings.training_mode && rec.reason) {
+            messageText += `\nПричина: ${rec.reason}`;
+        }
+    } else {
+        messageText = rec.text;
+    }
+    
+    const minDelay = this.settings.min_delay_ms || 1000;
+    const maxDelay = this.settings.max_delay_ms || 3000;
+    const delay = Math.floor(Math.random() * (maxDelay - minDelay + 1)) + minDelay;
+
+    return new Promise(resolve => {
+        setTimeout(() => {
+            axios.post(`${this.apiUrl}/sendMessage`, { chat_id: this.chatId, text: messageText })
+              .catch(error => console.error('Ошибка отправки в Telegram:', error.response ? error.response.data : error.message))
+              .finally(() => {
+                  resolve();
+              });
+        }, delay);
+    });
+  }
+}
+
+module.exports = Messenger;
+
+================================================================================
+
+--- Файл: .\package.json ---
+
+{
+  "name": "desktop-utility-service",
+  "version": "3.4.5",
+  "description": "Stealth poker advisor bot",
+  "main": "main.js",
+  "author": "viktor",
+  "scripts": {
+    "start": "electron .",
+    "dist": "electron-builder"
+  },
+  "dependencies": {
+    "axios": "^1.6.8",
+    "electron-store": "^8.2.0",
+    "electron-updater": "^6.1.8",
+    "node-tesseract-ocr": "^2.2.1",
+    "poker-evaluator": "^2.0.0",
+    "screenshot-desktop": "^1.15.0",
+    "sharp": "^0.33.3"
+  },
+  "devDependencies": {
+    "electron": "^29.1.0",
+    "electron-builder": "^24.13.3"
+  },
+  "build": {
+    "appId": "com.poker-advisor.app",
+    "productName": "Poker Advisor",
+    "win": {
+      "target": "nsis",
+      "icon": "build/icon.ico"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true
+    },
+    "publish": {
+      "provider": "github",
+      "owner": "viktoruskaa",
+      "repo": "poker-advisor-releases"
+    }
+  }
+}
+
+================================================================================
+
+--- Файл: .\parser.js ---
+
+const tesseract = require('node-tesseract-ocr');
+const sharp = require('sharp');
+const logger = require('./logger.js');
+
+class Parser {
+  constructor(config, eventBus) {
+    this.bus = eventBus;
+    let tesseractPath = config.tesseract_path;
+    if (!tesseractPath.startsWith('"') && !tesseractPath.endsWith('"')) {
+      tesseractPath = `"${tesseractPath}"`;
+    }
+
+    this.cardConfig = { lang: 'eng', oem: 1, psm: 7, binary: tesseractPath, 'tessedit_char_whitelist': '23456789TJQKAcdhs' };
+    this.textConfig = { lang: 'eng', oem: 1, psm: 7, binary: tesseractPath };
+    this.numberConfig = { lang: 'eng', oem: 1, psm: 7, binary: tesseractPath, 'tessedit_char_whitelist': '0123456789.,$' };
+
+    this.lastRecognizedData = {};
+  }
+
+  async processArea(imageBuffer, areaName) {
+    try {
+      const processedBuffer = await sharp(imageBuffer).grayscale().normalize().sharpen().toBuffer();
+      
+      let config;
+      if (areaName.includes('cards')) config = this.cardConfig;
+      else if (areaName.includes('stack') || areaName.includes('bet') || areaName.includes('pot')) config = this.numberConfig;
+      else config = this.textConfig;
+
+      const text = (await tesseract.recognize(processedBuffer, config)).trim();
+
+      if (this.lastRecognizedData[areaName] === text) return;
+      this.lastRecognizedData[areaName] = text;
+      logger.log(`[${areaName}]: Распознано -> "${text}"`);
+
+      this.parseAndEmit(text, areaName);
+
+    } catch (error) {
+      logger.log(`Ошибка Tesseract в области [${areaName}]: ${error.message}`);
+    }
+  }
+
+  parseAndEmit(text, areaName) {
+    if (!text) return;
+
+    if (areaName === 'community_cards') {
+      const cards = this._extractCards(text);
+      if (cards && cards.length >= 3) {
+        if (cards.length === 3) this.bus.emit('action', { type: 'DEAL_FLOP', cards });
+        if (cards.length === 4) this.bus.emit('action', { type: 'DEAL_TURN', cards: cards.slice(3) });
+        if (cards.length === 5) this.bus.emit('action', { type: 'DEAL_RIVER', cards: cards.slice(4) });
+      }
+      return;
+    }
+    if (areaName === 'pot_size') {
+      const pot = this._extractNumber(text);
+      if (pot !== null) this.bus.emit('action', { type: 'POT_UPDATE', amount: pot });
+      return;
+    }
+
+    const seatMatch = areaName.match(/seat_(\d+)_(name|stack|bet)/);
+    if (seatMatch) {
+      const seatId = parseInt(seatMatch[1], 10);
+      const dataType = seatMatch[2];
+
+      if (dataType === 'name') {
+        this.bus.emit('player_info', { seatId, name: text });
+      } else if (dataType === 'stack') {
+        const stack = this._extractNumber(text);
+        if (stack !== null) this.bus.emit('player_info', { seatId, stack });
+      } else if (dataType === 'bet') {
+        const bet = this._extractNumber(text);
+        if (bet !== null) this.bus.emit('player_action', { seatId, type: 'BET', amount: bet });
+      }
+    }
+  }
+
+  _extractCards(text) {
+    const cleanedText = text.replace(/\s/g, '').replace(/i/gi, 'J').replace(/O/gi, 'Q').replace(/1/g, 'T');
+    const potentialCards = cleanedText.match(/[2-9TJQKAcdhs]{2}/g) || [];
+    const validCards = [];
+    for (const cardStr of potentialCards) {
+      if (/^[2-9TJQKA]$/i.test(cardStr[0]) && /^[cdhs]$/i.test(cardStr[1])) {
+        validCards.push(cardStr);
+      }
+    }
+    return validCards.length > 0 ? validCards : null;
+  }
+
+  _extractNumber(text) {
+    const cleaned = text.replace(/[^0-9.]/g, '');
+    const number = parseFloat(cleaned);
+    return isNaN(number) ? null : number;
+  }
+}
+
+module.exports = Parser;
+
+================================================================================
+
+--- Файл: .\profiler.js ---
+
+const Store = require('electron-store');
+
+class Profiler {
+  constructor() {
+    this.store = new Store({ name: 'player-stats' });
+    this.sessionStats = {};
+  }
+
+  onNewHand(players) {
+    this.sessionStats = {};
+    if (Array.isArray(players)) {
+        players.forEach(p => {
+          this.sessionStats[p.name] = { vpip: false, pfr: false };
+        });
+    }
+  }
+
+  processAction(action) {
+    // ВАЖНО: Текущий парсер не предоставляет детальных данных.
+    // Эта функция написана "на вырост" и будет работать, когда парсер будет улучшен.
+    const player = action.player;
+    if (!player) return;
+
+    const stats = this.store.get(player, this._getDefaultStats());
+
+    // Базовая статистика VPIP/PFR
+    if (['CALL', 'RAISE', 'BET'].includes(action.type) && !this.sessionStats[player]?.vpip) {
+      stats.vpip_hands++;
+      this.sessionStats[player].vpip = true;
+    }
+    if (action.type === 'RAISE' && action.street === 'preflop' && !this.sessionStats[player]?.pfr) {
+      stats.pfr_hands++;
+      this.sessionStats[player].pfr = true;
+    }
+
+    // Продвинутая статистика (требует улучшенного парсера)
+    if (action.type === '3-BET') stats.three_bet_hands++;
+    if (action.type === 'FOLD_TO_CBET') stats.fold_to_cbet_hands++;
+    if (action.type === 'CBET_OPPORTUNITY') stats.cbet_opportunities++;
+    if (['BET', 'RAISE'].includes(action.type)) stats.aggressive_actions++;
+    if (action.type === 'CALL') stats.passive_actions++;
+    if (action.type === 'WENT_TO_SHOWDOWN') stats.wtsd_hands++;
+    
+    stats.total_hands++;
+    this.store.set(player, stats);
+  }
+
+  getProfiles(opponents) {
+    const profiles = {};
+    if (Array.isArray(opponents)) {
+        opponents.forEach(opp => {
+          const stats = this.store.get(opp.name, this._getDefaultStats());
+          const calculatedStats = this._calculateStats(stats);
+          profiles[opp.name] = {
+              ...calculatedStats,
+              classification: this._classifyPlayer(calculatedStats)
+          };
+        });
+    }
+    return profiles;
+  }
+
+  _calculateStats(stats) {
+    const { total_hands, vpip_hands, pfr_hands, aggressive_actions, passive_actions, fold_to_cbet_hands, cbet_opportunities, wtsd_hands, three_bet_hands } = stats;
+    const vpip = total_hands > 0 ? (vpip_hands / total_hands) * 100 : 0;
+    const pfr = total_hands > 0 ? (pfr_hands / total_hands) * 100 : 0;
+    const af = passive_actions > 0 ? aggressive_actions / passive_actions : aggressive_actions;
+    const foldToCbet = cbet_opportunities > 0 ? (fold_to_cbet_hands / cbet_opportunities) * 100 : 0;
+    const wtsd = total_hands > 0 ? (wtsd_hands / total_hands) * 100 : 0;
+    const threeBet = total_hands > 0 ? (three_bet_hands / total_hands) * 100 : 0;
+
+    return { vpip, pfr, af, foldToCbet, wtsd, threeBet, total_hands };
+  }
+
+  _classifyPlayer(stats) {
+    const { vpip, pfr, af } = stats;
+    if (stats.total_hands < 50) return 'Unknown';
+
+    // Классификация на основе вашей таблицы
+    if (vpip > 35 && pfr < 10 && af < 1.5) return 'Loose-Passive (Fish)';
+    if (vpip > 24 && pfr > 18) return 'Loose-Aggressive (LAG)';
+    if (vpip < 15 && pfr < 10) return 'Tight-Passive (Nit)';
+    if (vpip < 18 && pfr > 10 && af > 3) return 'Tight-Aggressive (TAG)';
+    
+    return 'Standard';
+  }
+
+  _getDefaultStats() {
+    return {
+      total_hands: 0,
+      vpip_hands: 0,
+      pfr_hands: 0,
+      three_bet_hands: 0,
+      cbet_opportunities: 0,
+      fold_to_cbet_hands: 0,
+      wtsd_hands: 0,
+      aggressive_actions: 0,
+      passive_actions: 0
+    };
+  }
+}
+
+module.exports = Profiler;
+
+================================================================================
+
+--- Файл: .\.github\workflows\release.yml ---
+
+name: Build and Release
+
+on:
+  push:
+    branches:
+      - main # или master, в зависимости от вашей основной ветки
+
+jobs:
+  release:
+    runs-on: windows-latest
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Check out git repository
+        uses: actions/checkout@v3
+
+      - name: Install Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: 18
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Build and release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: npm run dist -- --publish always
+
+================================================================================
+
