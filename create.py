@@ -55,7 +55,8 @@ if __name__ == "__main__":
     output_filename = f"{project_name}_contents.txt"
 
     # --- Списки исключений ---
-    dirs_to_exclude = ['node_modules', '.git', '.vscode', '__pycache__']
+    # ДОБАВЛЕНЫ '.venv' и 'resources' В СПИСОК ИСКЛЮЧАЕМЫХ ПАПОК
+    dirs_to_exclude = ['.venv', 'resources', 'node_modules', '.git', '.vscode', '__pycache__']
     files_to_exclude = ['package-lock.json', 'create.py']
 
     # Добавляем в исключения сам скрипт и его выходной файл, чтобы они не попали в результат
