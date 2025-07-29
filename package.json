@@ -1,6 +1,6 @@
 {
   "name": "desktop-utility-service",
-  "version": "4.3.0",
+  "version": "5.0.0",
   "description": "Stealth poker advisor bot",
   "main": "main.js",
   "author": "viktor",
@@ -15,7 +15,9 @@
     "electron-updater": "^6.1.8",
     "lodash.isequal": "^4.5.0",
     "poker-evaluator": "^2.0.0",
-    "screenshot-desktop": "^1.15.0"
+    "screenshot-desktop": "^1.15.0",
+    "sharp": "^0.33.4",
+    "tesseract.js": "^5.1.0"
   },
   "devDependencies": {
     "electron": "^29.1.0",
@@ -40,9 +42,6 @@
       "output": "dist",
       "app": "."
     },
-    "extraResources": [
-      "resources/"
-    ],
     "publish": {
       "provider": "github",
       "owner": "viktoruskaa",
