@@ -1,6 +1,6 @@
 {
   "name": "desktop-utility-service",
-  "version": "5.0.0",
+  "version": "5.0.1",
   "description": "Stealth poker advisor bot",
   "main": "main.js",
   "author": "viktor",
